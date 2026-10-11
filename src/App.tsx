@@ -75,7 +75,35 @@ export default function App() {
       if (remoteData) {
         if (remoteData.hotspots?.length) setHotspots(remoteData.hotspots);
         if (remoteData.candidateSites?.length) setCandidateSites(remoteData.candidateSites);
-        if (remoteData.reports?.length) setCitizenReports(remoteData.reports);
+        if (remoteData.reports?.length) {
+          setCitizenReports(remoteData.reports);
+          const customSpots: Hotspot[] = remoteData.reports
+            .filter((r) => !r.hotspotId && r.coords)
+            .map((r) => ({
+              id: `hs-${r.id}`,
+              name: r.locationName || 'Citizen Field Report Spot',
+              locationName: r.locationName || 'South Delhi Ward 142 Corridor',
+              coords: r.coords,
+              elevation: 211.2,
+              confidence: 'reports_only' as const,
+              reportCount: 1,
+              catchmentAreaM2: 19500,
+              landCover: { pavedPercent: 76, roofPercent: 16, greenPercent: 8 },
+              weightedRunoffCoeff: 0.83,
+              typicalDepth: r.depthCategory || 'knee',
+              typicalDuration: r.durationCategory || '2_to_6h',
+              sewageAdjacent: false,
+              nearestNalaDistanceM: 380,
+              historicalNotes: r.notes || 'Crowd-sourced waterlogging report synced via AWS DynamoDB.',
+            }));
+          if (customSpots.length > 0) {
+            setHotspots((prev) => {
+              const existingIds = new Set(prev.map((h) => h.id));
+              const newOnes = customSpots.filter((c) => !existingIds.has(c.id));
+              return [...newOnes, ...prev];
+            });
+          }
+        }
       }
     });
   }, []);

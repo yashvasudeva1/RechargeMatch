@@ -1,14 +1,36 @@
 import { CitizenReport, Hotspot, CandidateSite } from '../types/hydrology';
 
-const API_BASE_URL = (import.meta as any).env?.VITE_AWS_API_GATEWAY_URL || '';
+const DEFAULT_AWS_API_URL = 'https://wd239csyn7.execute-api.ap-southeast-2.amazonaws.com';
+
+const API_BASE_URL =
+  (import.meta as any).env?.VITE_AWS_API_GATEWAY_URL || DEFAULT_AWS_API_URL;
 
 export function isAwsConfigured(): boolean {
   return Boolean(API_BASE_URL && API_BASE_URL.trim().length > 0);
 }
 
+export async function checkAwsHealth(): Promise<{
+  status: string;
+  region: string;
+  table: string;
+  bucket: string;
+} | null> {
+  if (!isAwsConfigured()) return null;
+
+  try {
+    const response = await fetch(`${API_BASE_URL.replace(/\/$/, '')}/health`, {
+      method: 'GET',
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchWardDatasetFromAws(wardId = 'ward-142'): Promise<{
-  hotspots: Hotspot[];
-  candidateSites: CandidateSite[];
+  hotspots?: Hotspot[];
+  candidateSites?: CandidateSite[];
   reports: CitizenReport[];
 } | null> {
   if (!isAwsConfigured()) return null;
