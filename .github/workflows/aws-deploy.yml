@@ -1,0 +1,56 @@
+name: Deploy RechargeMatch to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Runs automatically once AWS_ACCESS_KEY_ID is configured in GitHub Repo Secrets
+    if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+      - name: Provision AWS Serverless Stack (DynamoDB, S3, Lambda, API Gateway)
+        run: |
+          aws cloudformation deploy \
+            --template-file aws/template.yaml \
+            --stack-name rechargematch-stack \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Read API Gateway Endpoint
+        id: cf_outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name rechargematch-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiGatewayInvokeUrl'].OutputValue" \
+            --output text)
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Install Dependencies & Build Frontend with Live AWS API URL
+        env:
+          VITE_GOOGLE_MAPS_API_KEY: ${{ secrets.VITE_GOOGLE_MAPS_API_KEY }}
+          VITE_AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          VITE_AWS_API_GATEWAY_URL: ${{ steps.cf_outputs.outputs.api_url }}
+        run: |
+          npm ci
+          npm run lint
+          npm run build

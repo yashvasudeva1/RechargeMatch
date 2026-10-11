@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  RechargeMatch Serverless Cloud Stack (DynamoDB, S3 Evidence Bucket, Lambda API Handler, and HTTP API Gateway)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: rechargematch
+    Description: Prefix for provisioned AWS resources
+
+Resources:
+  # 1. DynamoDB Table for Citizen Waterlogging Reports & Ward Telemetry
+  RechargeMatchReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-reports"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: wardId
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: wardId
+          KeyType: HASH
+        - AttributeName: id
+          KeyType: RANGE
+
+  # 2. S3 Bucket for Sanitized Citizen Field Evidence Photos
+  RechargeMatchEvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-evidence-${AWS::AccountId}-${AWS::Region}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+  # 3. IAM Execution Role for Lambda
+  RechargeMatchLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RechargeMatchDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt RechargeMatchReportsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${RechargeMatchEvidenceBucket.Arn}/*"
+
+  # 4. AWS Lambda Function (Node.js 20.x with built-in AWS SDK v3)
+  RechargeMatchApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api-handler"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt RechargeMatchLambdaRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          DDB_TABLE: !Ref RechargeMatchReportsTable
+          S3_BUCKET: !Ref RechargeMatchEvidenceBucket
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { DynamoDBDocumentClient, PutCommand, QueryCommand } = require("@aws-sdk/lib-dynamodb");
+          const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+          const region = process.env.AWS_REGION || "ap-south-1";
+          const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
+          const s3 = new S3Client({ region });
+
+          const TABLE_NAME = process.env.DDB_TABLE;
+          const BUCKET_NAME = process.env.S3_BUCKET;
+
+          const corsHeaders = {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "OPTIONS,GET,POST,PUT"
+          };
+
+          exports.handler = async (event) => {
+            const method = event.requestContext?.http?.method || event.httpMethod || "GET";
+            const path = event.rawPath || event.path || "/";
+
+            if (method === "OPTIONS") {
+              return { statusCode: 200, headers: corsHeaders, body: "" };
+            }
+
+            try {
+              if (method === "GET" && path.endsWith("/health")) {
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    status: "healthy",
+                    service: "RechargeMatch Hydrological Cloud API",
+                    region,
+                    table: TABLE_NAME,
+                    bucket: BUCKET_NAME
+                  })
+                };
+              }
+
+              if (method === "POST" && path.endsWith("/reports")) {
+                const report = JSON.parse(event.body || "{}");
+                const item = {
+                  wardId: report.wardId || "ward-142",
+                  id: report.id || `rep-${Date.now()}`,
+                  ...report,
+                  createdAt: new Date().toISOString()
+                };
+                await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+                return {
+                  statusCode: 201,
+                  headers: corsHeaders,
+                  body: JSON.stringify({ synced: true, id: item.id, item })
+                };
+              }
+
+              if (method === "POST" && path.endsWith("/uploads/presign")) {
+                const { fileName, contentType } = JSON.parse(event.body || "{}");
+                const safeName = (fileName || "photo.jpg").replace(/[^a-zA-Z0-9._-]/g, "_");
+                const key = `reports/${Date.now()}-${safeName}`;
+                const command = new PutObjectCommand({
+                  Bucket: BUCKET_NAME,
+                  Key: key,
+                  ContentType: contentType || "image/jpeg"
+                });
+                const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+                const publicFileUrl = `https://${BUCKET_NAME}.s3.${region}.amazonaws.com/${key}`;
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify({ uploadUrl, publicFileUrl })
+                };
+              }
+
+              if (method === "GET" && path.includes("/wards/")) {
+                const wardId = path.split("/").pop() || "ward-142";
+                const result = await ddb.send(
+                  new QueryCommand({
+                    TableName: TABLE_NAME,
+                    KeyConditionExpression: "wardId = :w",
+                    ExpressionAttributeValues: { ":w": wardId }
+                  })
+                );
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify({ wardId, reports: result.Items || [] })
+                };
+              }
+
+              return {
+                statusCode: 404,
+                headers: corsHeaders,
+                body: JSON.stringify({ error: "Route not found", path })
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                headers: corsHeaders,
+                body: JSON.stringify({ error: err.message || "Internal server error" })
+              };
+            }
+          };
+
+  # 5. Amazon API Gateway v2 (HTTP API)
+  RechargeMatchHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-http-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+
+  RechargeMatchLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RechargeMatchHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt RechargeMatchApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RechargeMatchDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RechargeMatchHttpApi
+      RouteKey: "$default"
+      Target: !Sub "integrations/${RechargeMatchLambdaIntegration}"
+
+  RechargeMatchApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RechargeMatchHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  RechargeMatchLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RechargeMatchApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RechargeMatchHttpApi}/*/*"
+
+Outputs:
+  ApiGatewayInvokeUrl:
+    Description: Invoke URL for RechargeMatch HTTP API Gateway (set as VITE_AWS_API_GATEWAY_URL)
+    Value: !GetAtt RechargeMatchHttpApi.ApiEndpoint
+  DynamoDBTableName:
+    Description: DynamoDB Table storing citizen reports
+    Value: !Ref RechargeMatchReportsTable
+  S3BucketName:
+    Description: S3 Bucket for citizen report photos
+    Value: !Ref RechargeMatchEvidenceBucket
